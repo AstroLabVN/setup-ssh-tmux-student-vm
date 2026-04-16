@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2016
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly STUDENT_USER='ben'
+readonly STUDENT_USER='vagrant'
 readonly TMUX_SESSION='class'
-readonly LAN_CIDR='192.168.1.0/24'
-readonly SSHD_DROPIN='/etc/ssh/sshd_config.d/99-classroom-ben.conf'
+readonly SSHD_DROPIN='/etc/ssh/sshd_config.d/99-classroom-vagrant.conf'
 readonly BASHRC_SNIPPET_BEGIN='# >>> classroom tmux auto-attach >>>'
 readonly BASHRC_SNIPPET_END='# <<< classroom tmux auto-attach <<<'
-
-# Replace this with your real public key before using the script.
 readonly TEACHER_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPy3I6/T99jJIvCcRNC32WWRGYChal9P39jrrsB2aOmB ssh_tmux_student_vm'
 
 log() {
@@ -37,7 +33,7 @@ trap 'on_error "${LINENO}"' ERR
 
 require_root() {
   if [[ ${EUID} -ne 0 ]]; then
-    die 'Please run this script with sudo, for example: curl -fsSL URL | sudo bash'
+    die "Please run this script with sudo, for example: curl -fsSL 'https://raw.githubusercontent.com/AstroLabVN/setup-ssh-tmux-student-vm/main/setup.sh' | sudo bash"
   fi
 }
 
@@ -54,39 +50,98 @@ require_debian_like() {
   fi
 }
 
+ensure_user_exists() {
+  if ! id "${STUDENT_USER}" >/dev/null 2>&1; then
+    die "User ${STUDENT_USER} does not exist on this VM."
+  fi
+}
+
+configure_fast_apt_mirror() {
+  local sources_file='/etc/apt/sources.list.d/ubuntu.sources'
+  local backup_file='/etc/apt/sources.list.d/ubuntu.sources.bak'
+  local chosen_mirror=''
+  local mirror=''
+
+  local -a mirrors=(
+    'https://mirror.clearsky.vn/ubuntu/'
+    'http://mirror.viettelcloud.vn/ubuntu/'
+    'https://mirror.azvps.vn/ubuntu/'
+    'https://ftp.udx.icscoe.jp/Linux/ubuntu/'
+    'http://tw.archive.ubuntu.com/ubuntu/'
+  )
+
+  log 'Forcing IPv4 for apt'
+  cat > /etc/apt/apt.conf.d/99force-ipv4 <<'EOF'
+Acquire::ForceIPv4 "true";
+EOF
+
+  log 'Setting apt retries and timeouts'
+  cat > /etc/apt/apt.conf.d/99lab-speed <<'EOF'
+Acquire::Retries "2";
+Acquire::http::Timeout "10";
+Acquire::https::Timeout "10";
+EOF
+
+  if [[ ! -f "${sources_file}" ]]; then
+    warn "Could not find ${sources_file}; skipping mirror rewrite"
+    return 0
+  fi
+
+  log "Backing up ${sources_file} to ${backup_file}"
+  cp "${sources_file}" "${backup_file}"
+
+  log 'Testing mirrors'
+  for mirror in "${mirrors[@]}"; do
+    printf '[INFO] Testing mirror: %s\n' "${mirror}"
+    if curl -4 -L --silent --show-error --output /dev/null --max-time 8 "${mirror}dists/"; then
+      chosen_mirror="${mirror}"
+      printf '[INFO] Selected mirror: %s\n' "${chosen_mirror}"
+      break
+    fi
+  done
+
+  if [[ -z "${chosen_mirror}" ]]; then
+    warn 'No custom mirror responded in time; keeping existing Ubuntu sources'
+    return 0
+  fi
+
+  log 'Rewriting ubuntu.sources'
+  sed -Ei \
+    -e "s|https?://([a-z]{2}\.)?archive\.ubuntu\.com/ubuntu/|${chosen_mirror}|g" \
+    -e "s|https?://security\.ubuntu\.com/ubuntu/|${chosen_mirror}|g" \
+    "${sources_file}"
+
+  log 'Updated apt sources file'
+  cat "${sources_file}"
+}
+
 install_packages() {
   log 'Updating apt package lists'
   apt update
 
-  log 'Installing openssh-server and tmux'
-  DEBIAN_FRONTEND=noninteractive apt install -y openssh-server tmux
-}
-
-ensure_user_exists() {
-  if id "${STUDENT_USER}" >/dev/null 2>&1; then
-    log "User ${STUDENT_USER} already exists"
-  else
-    log "Creating user ${STUDENT_USER}"
-    adduser --disabled-password --gecos '' "${STUDENT_USER}"
-  fi
+  log 'Installing curl, openssh-server and tmux'
+  DEBIAN_FRONTEND=noninteractive apt install -y curl openssh-server tmux
 }
 
 configure_ssh_dir() {
   local user_home
-  user_home="$(getent passwd "${STUDENT_USER}" | cut -d: -f6)"
+  local auth_keys_file
 
+  user_home="$(getent passwd "${STUDENT_USER}" | cut -d: -f6)"
   [[ -n "${user_home}" ]] || die "Could not determine home directory for ${STUDENT_USER}"
+
+  auth_keys_file="${user_home}/.ssh/authorized_keys"
 
   log "Creating SSH directory for ${STUDENT_USER}"
   install -d -m 700 -o "${STUDENT_USER}" -g "${STUDENT_USER}" "${user_home}/.ssh"
 
   log "Writing authorized_keys for ${STUDENT_USER}"
-  cat > "${user_home}/.ssh/authorized_keys" <<EOF
-from="${LAN_CIDR}" ${TEACHER_PUBLIC_KEY}
+  cat > "${auth_keys_file}" <<EOF
+${TEACHER_PUBLIC_KEY}
 EOF
 
-  chown "${STUDENT_USER}:${STUDENT_USER}" "${user_home}/.ssh/authorized_keys"
-  chmod 600 "${user_home}/.ssh/authorized_keys"
+  chown "${STUDENT_USER}:${STUDENT_USER}" "${auth_keys_file}"
+  chmod 600 "${auth_keys_file}"
 }
 
 configure_sshd() {
@@ -106,8 +161,11 @@ PermitEmptyPasswords no
 UsePAM yes
 EOF
 
+  log 'Ensuring /run/sshd exists'
+  install -d -m 755 /run/sshd
+
   log 'Validating sshd configuration'
-  sshd -t
+  /usr/sbin/sshd -t
 
   log 'Enabling and starting SSH service'
   systemctl enable --now ssh
@@ -163,85 +221,21 @@ print_summary() {
   printf '\n'
   printf 'User: %s\n' "${STUDENT_USER}"
   printf 'tmux session: %s\n' "${TMUX_SESSION}"
-  printf 'Allowed SSH source range for your key: %s\n' "${LAN_CIDR}"
   printf '\n'
   printf 'Connect from your machine with:\n'
-  printf 'ssh %s@%s\n' "${STUDENT_USER}" "${primary_ip}"
+  printf 'ssh -i ~/.ssh/astrolab/ssh_tmux_student_vm %s@%s\n' "${STUDENT_USER}" "${primary_ip}"
   printf '\n'
   printf 'Because tmux auto-attach is enabled, both of you should land in the same shared session.\n'
-  printf 'If needed, manual tmux command is:\n'
+  printf 'If needed, the manual tmux command is:\n'
   printf 'tmux new-session -A -s %s\n' "${TMUX_SESSION}"
-  printf '\n'
-  printf 'Reminder: replace the placeholder public key in this script before using it.\n'
-}
-
-configure_fast_apt_mirror() {
-  local sources_file='/etc/apt/sources.list.d/ubuntu.sources'
-  local backup_file='/etc/apt/sources.list.d/ubuntu.sources.bak'
-  local chosen_mirror=''
-  local mirror=''
-
-  local -a mirrors=(
-    'https://mirror.clearsky.vn/ubuntu/'
-    'http://mirror.viettelcloud.vn/ubuntu/'
-    'https://mirror.azvps.vn/ubuntu/'
-    'https://ftp.udx.icscoe.jp/Linux/ubuntu/'
-    'http://tw.archive.ubuntu.com/ubuntu/'
-  )
-
-  log 'Forcing IPv4 for apt'
-  cat > /etc/apt/apt.conf.d/99force-ipv4 <<'EOF'
-Acquire::ForceIPv4 "true";
-EOF
-
-  log 'Setting apt retries and timeouts'
-  cat > /etc/apt/apt.conf.d/99lab-speed <<'EOF'
-Acquire::Retries "2";
-Acquire::http::Timeout "10";
-Acquire::https::Timeout "10";
-EOF
-
-  if [[ ! -f "${sources_file}" ]]; then
-    warn "Could not find ${sources_file}; skipping mirror rewrite"
-    return 0
-  fi
-
-  log "Backing up ${sources_file}"
-  cp "${sources_file}" "${backup_file}"
-
-  log 'Testing mirrors'
-  for mirror in "${mirrors[@]}"; do
-    printf '[INFO] Testing mirror: %s\n' "${mirror}"
-    if curl -4 -L --silent --show-error --output /dev/null --max-time 8 "${mirror}dists/"; then
-      chosen_mirror="${mirror}"
-      printf '[INFO] Selected mirror: %s\n' "${chosen_mirror}"
-      break
-    fi
-  done
-
-  if [[ -z "${chosen_mirror}" ]]; then
-    warn 'No custom mirror responded in time; keeping existing Ubuntu sources'
-    return 0
-  fi
-
-  log 'Rewriting ubuntu.sources'
-  sed -i \
-    -e "s|http://archive.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
-    -e "s|https://archive.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
-    -e "s|http://security.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
-    -e "s|https://security.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
-    "${sources_file}"
-
-  log 'Updated apt sources file'
-  cat "${sources_file}"
 }
 
 main() {
   require_root
   require_debian_like
+  ensure_user_exists
   configure_fast_apt_mirror
   install_packages
-  ensure_user_exists
   configure_ssh_dir
   configure_sshd
   install_tmux_auto_attach
@@ -250,4 +244,3 @@ main() {
 }
 
 main "$@"
-
