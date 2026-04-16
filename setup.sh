@@ -175,9 +175,71 @@ print_summary() {
   printf 'Reminder: replace the placeholder public key in this script before using it.\n'
 }
 
+configure_fast_apt_mirror() {
+  local sources_file='/etc/apt/sources.list.d/ubuntu.sources'
+  local backup_file='/etc/apt/sources.list.d/ubuntu.sources.bak'
+  local chosen_mirror=''
+  local mirror=''
+
+  local -a mirrors=(
+    'https://mirror.clearsky.vn/ubuntu/'
+    'http://mirror.viettelcloud.vn/ubuntu/'
+    'https://mirror.azvps.vn/ubuntu/'
+    'https://ftp.udx.icscoe.jp/Linux/ubuntu/'
+    'http://tw.archive.ubuntu.com/ubuntu/'
+  )
+
+  log 'Forcing IPv4 for apt'
+  cat > /etc/apt/apt.conf.d/99force-ipv4 <<'EOF'
+Acquire::ForceIPv4 "true";
+EOF
+
+  log 'Setting apt retries and timeouts'
+  cat > /etc/apt/apt.conf.d/99lab-speed <<'EOF'
+Acquire::Retries "2";
+Acquire::http::Timeout "10";
+Acquire::https::Timeout "10";
+EOF
+
+  if [[ ! -f "${sources_file}" ]]; then
+    warn "Could not find ${sources_file}; skipping mirror rewrite"
+    return 0
+  fi
+
+  log "Backing up ${sources_file}"
+  cp "${sources_file}" "${backup_file}"
+
+  log 'Testing mirrors'
+  for mirror in "${mirrors[@]}"; do
+    printf '[INFO] Testing mirror: %s\n' "${mirror}"
+    if curl -4 -L --silent --show-error --output /dev/null --max-time 8 "${mirror}dists/"; then
+      chosen_mirror="${mirror}"
+      printf '[INFO] Selected mirror: %s\n' "${chosen_mirror}"
+      break
+    fi
+  done
+
+  if [[ -z "${chosen_mirror}" ]]; then
+    warn 'No custom mirror responded in time; keeping existing Ubuntu sources'
+    return 0
+  fi
+
+  log 'Rewriting ubuntu.sources'
+  sed -i \
+    -e "s|http://archive.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
+    -e "s|https://archive.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
+    -e "s|http://security.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
+    -e "s|https://security.ubuntu.com/ubuntu/|${chosen_mirror}|g" \
+    "${sources_file}"
+
+  log 'Updated apt sources file'
+  cat "${sources_file}"
+}
+
 main() {
   require_root
   require_debian_like
+  configure_fast_apt_mirror
   install_packages
   ensure_user_exists
   configure_ssh_dir
