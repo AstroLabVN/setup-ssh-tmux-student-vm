@@ -135,10 +135,11 @@ configure_ssh_dir() {
   log "Creating SSH directory for ${STUDENT_USER}"
   install -d -m 700 -o "${STUDENT_USER}" -g "${STUDENT_USER}" "${user_home}/.ssh"
 
-  log "Writing authorized_keys for ${STUDENT_USER}"
-  cat > "${auth_keys_file}" <<EOF
-${TEACHER_PUBLIC_KEY}
-EOF
+  log "Adding teacher key to authorized_keys for ${STUDENT_USER}"
+  touch "${auth_keys_file}"
+  if ! grep -Fq "${TEACHER_PUBLIC_KEY}" "${auth_keys_file}"; then
+    printf '%s\n' "${TEACHER_PUBLIC_KEY}" >> "${auth_keys_file}"
+  fi
 
   chown "${STUDENT_USER}:${STUDENT_USER}" "${auth_keys_file}"
   chmod 600 "${auth_keys_file}"
